@@ -1,0 +1,7 @@
+# python specific
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints
+
+# mac rubbish
+.DS_Store
