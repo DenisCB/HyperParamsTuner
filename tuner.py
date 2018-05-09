@@ -3,7 +3,9 @@ import numpy as np
 import time
 import xgboost as xgb
 import lightgbm as lgb
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
+
+from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
 from hyperopt import fmin, tpe, hp, Trials, space_eval
 
 
@@ -14,7 +16,8 @@ class Tuner:
         train, ytrain,
         model, maximize,
         base_params, tunable_params, integer_params=[],
-        n_splits=5, stratify=False, split_seed=0
+        n_splits=5, stratify=False, split_seed=0,
+        metric=None, return_labels=False
     ):
         """
         Tuner searches for best hyperparameters on train data using
@@ -33,8 +36,11 @@ class Tuner:
 
         Input data:
         train, ytrain (pd.DataFrame/numpy.array/scipy.csr_matrix) - train data
-        model (str) - surrently only 'lgb' or 'xgb', model which to tune.
-        maximize (bool) - whether ot maximize the metric in base_params.
+        model ('lgb' or 'xgb' or sklearn non-initialized model) - model
+            to tune.
+        maximize (bool) - whether ot maximize the metric. If boosting model is
+            being tuned - applied to metric in base_params. If sklearn model -
+            to self.metric.
 
         base_params (dict) - base non-tunable parameters for model.
         tunable_params (dict of hyperopt.hp objects) - parameters to tune.
@@ -44,6 +50,10 @@ class Tuner:
         n_splits (int) - number of splits for CV.
         stratify (bool) - whether use StratifiedKFold of common KFold
         split_seed (int) - seed for CV
+        metric - function, that accepts (true_values, predicted_values)
+            and returns float. Only needed for sklearn models.
+        return_labels (bool) - if False - return probabilities, otherwise -
+            predicted labels. Is only used for classification and sklearn.
         """
         self.train = train
         self.ytrain = ytrain
@@ -59,6 +69,9 @@ class Tuner:
         self.split_seed = split_seed
         self.stratify = stratify
 
+        self.metric = metric
+        self.return_labels = return_labels
+
         self.results = pd.DataFrame()
         self.trials = Trials()
         self.loss_history = []
@@ -66,6 +79,7 @@ class Tuner:
         self.t_start = None
         self.folds = None
         self.base_scores = {}
+
         if model == 'xgb':
             self.dtrain = xgb.DMatrix(train, ytrain)
         elif model == 'lgb':
@@ -97,7 +111,6 @@ class Tuner:
             max_evals=max_trials,
             trials=self.trials,
             return_argmin=False)
-
         self.fill_in_results_df()
         print('\n')
 
@@ -118,6 +131,8 @@ class Tuner:
     def get_base_score(self, epoch=0):
         self.reset_histories()
         base_score = self.get_score(self.base_params)
+        if self.maximize:
+            base_score *= -1
         print('Default parameters score for current folds:',
               round(base_score, 4))
         self.base_scores[epoch] = base_score
@@ -130,8 +145,13 @@ class Tuner:
     def fill_in_results_df(self):
 
         def process_dict(d):
+            # Parses trials object correctly.
             for k in d.keys():
                 d[k] = d[k][0]
+            d = space_eval(self.tunable_params, d)
+            for p in self.integer_params:
+                if p in d:
+                    d[p] = int(d[p])
             return d
 
         sorted_trials = sorted(
@@ -146,10 +166,10 @@ class Tuner:
              **self.base_params} for t in sorted_trials]
         self.results['num_iters'] = np.array(self.num_iters)[sorted_indexes]
         self.results['checks'] = 1
-        self.results['total_loss'] = [
-            t['result']['loss'] for t in sorted_trials]
-        self.results['1_epoch_loss'] = [
-            t['result']['loss'] for t in sorted_trials]
+        self.results['total_loss'] = np.array(
+            self.loss_history)[sorted_indexes]
+        self.results['1_epoch_loss'] = np.array(
+            self.loss_history)[sorted_indexes]
 
     def tune_not_first_epoch(self, epoch, max_trials):
         print('Started {} epoch of tuning'.format(epoch))
@@ -178,7 +198,7 @@ class Tuner:
 
         # In top will be values with max checks and min loss.
         self.results = self.results.sort_values(
-            ['checks', 'total_loss'], ascending=[False, True]
+            ['checks', 'total_loss'], ascending=[False, not self.maximize]
             ).reset_index(drop=True)
         print('\n')
 
@@ -209,21 +229,33 @@ class Tuner:
             k = [k for k in cvmodel.keys() if '-mean' in k][0]
             score = cvmodel[k][-1]
             best_iter = len(cvmodel[k])
+        elif isinstance(self.model(), BaseEstimator):
+            model = self.model(**params)
+            if isinstance(model, RegressorMixin) or self.return_labels:
+                method = 'predict'
+            else:
+                method = 'predict_proba'
+            oofs = cross_val_predict(
+                model, self.train, self.ytrain,
+                cv=self.folds, method=method)
+            score = self.metric(self.ytrain, oofs)
+            best_iter = 0
         else:
             raise NotImplementedError
 
-        if self.maximize:
-            score *= -1
-
         self.loss_history.append(score)
         self.num_iters.append(best_iter)
+
         if len(self.loss_history) > 1:
             print('{} trials are done in {} minutes. Best metric achieved is {}'.
                   format(
                     len(self.loss_history),
                     round((time.time() - self.t_start) / 60, 1),
-                    round(min(self.loss_history), 4)
+                    round(sorted(
+                        self.loss_history, reverse=self.maximize)[0], 4)
                     ), end='\r')
+        if self.maximize:
+            score *= -1
         return score
 
     def plot_1_epoch_results(self):
@@ -236,6 +268,8 @@ class Tuner:
         plt.figure(figsize=(10, 5))
         xs = [t['misc']['tid'] for t in self.trials.trials]
         ys = [t['result']['loss'] for t in self.trials.trials]
+        if self.maximize:
+            ys = [-y for y in ys]
 
         baseline = self.base_scores[1]
         delta = baseline - np.min(ys)
